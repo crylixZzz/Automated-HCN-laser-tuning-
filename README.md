@@ -89,7 +89,7 @@ void fine(float crestDeg)
   float bestV   = readVrms();
   const float halfV = bestV * 0.5f;
 
-  /* walk left to trough */
+  //capture left trough
   while (!limitFlag)
   {
     ustep(false); bestDeg -= uSTEP_DEG;
@@ -105,7 +105,7 @@ void fine(float crestDeg)
   while (!limitFlag && stepAbs != crestIdx) ustep(stepAbs < crestIdx);
   if (limitFlag) { retreatLimit(); return; }
 
-  /capture right trough
+  //capture right trough
   float right = crestDeg;
   while (!limitFlag)
   {
