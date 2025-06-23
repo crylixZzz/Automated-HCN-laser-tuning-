@@ -92,7 +92,7 @@ void retreatLimit()
     F("[SIM LIMIT] Left hit – retreat 2000° CW") :
     F("[SIM LIMIT] Right hit – retreat 2000° CCW"));
 
-  bool cw   = limitLeft;                     // left→CW ; right→CCW
+  bool cw   = limitLeft;                     // left->CW ; right->CCW
   long back = lround(2000.0f / uSTEP_DEG);
   for (long i=0; i<back; ++i) ustep(cw);
 
@@ -223,7 +223,7 @@ void setup()
   digitalWrite(EN_PIN, LOW);
 
   Serial.begin(115200);
-  Serial.println(F("[Sim] Ready – A / S / R / Y / L1 / L2"));
+  Serial.println(F("[Sim] Ready – A (2000 deg cw) / S (enter degrees) / R (reset home) / Y (disable motor) L1 (Left limit) / L2 (right limit)"));
 }
 
 void loop()
