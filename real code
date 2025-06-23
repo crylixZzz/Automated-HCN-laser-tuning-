@@ -206,7 +206,7 @@ void resetHome()
 //setup + loop
 void setup()
 {
-  /* pins */
+  //[ins
   pinMode(STEP_PIN, OUTPUT);
   pinMode(DIR_PIN,  OUTPUT);
   pinMode(EN_PIN,   OUTPUT);
@@ -214,7 +214,7 @@ void setup()
   pinMode(LIM_LEFT,  INPUT_PULLUP);
   pinMode(LIM_RIGHT, INPUT_PULLUP);
 
-  /* limit interrupts */
+  //limit inturrupt
   attachInterrupt(digitalPinToInterrupt(LIM_LEFT),  ISR_left,  FALLING);
   attachInterrupt(digitalPinToInterrupt(LIM_RIGHT), ISR_right, FALLING);
 
