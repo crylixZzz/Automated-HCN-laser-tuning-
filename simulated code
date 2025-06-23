@@ -99,7 +99,7 @@ void retreatLimit()
   limitFlag = false;
 }
 
-//finetune (sim
+//finetune (sim)
 void fine(float crestDeg)
 {
   Serial.println(F("--- Fine Start ---"));
