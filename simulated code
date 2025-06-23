@@ -1,4 +1,4 @@
-/*Plasma Density Scanner – REAL
+/*Plasma Density Scanner – SIMULATED
   • Driver :  TB6600  (STEP D8, DIR D9, EN D10  – active-LOW)
   • Sensor :  LTC1968  RMS-to-DC  →  Arduino A0  (0–5 V)
   • Limits :  Left  on D2  (INPUT_PULLUP, LOW = hit)
