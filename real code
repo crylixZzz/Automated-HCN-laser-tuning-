@@ -332,7 +332,7 @@ void fine(float crestDeg)
 // coarse tune
 void coarse()
 {
-  Serial.println(F("--- Coarse Start ---"));
+  Serial.println(F("Coarse tuning"));
   const bool cw    = (rngDeg > 0.0f);
   const long total = lround(fabs(rngDeg) / uSTEP_DEG);
 
@@ -371,7 +371,7 @@ void coarse()
 
   if (limitFlag) { retreatLimit(); return; }
 
-  Serial.print(F("--- Coarse Done ---\nPeak "));
+  Serial.print(F("coarse done\nPeak "));
   Serial.print(peakV,4); Serial.print(F(" V @ "));
   Serial.print(peakDeg,3); Serial.println(F("°"));
 
