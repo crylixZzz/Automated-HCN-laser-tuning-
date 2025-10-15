@@ -22,7 +22,7 @@ const byte LIM_RIGHT = 3;      // LOW = right limit hit
 const float STEP_DEG   = 0.9f;          // full-step
 const int   MICROSTEPS = 16;            // TB6600 set to 1/16
 const float uSTEP_DEG  = STEP_DEG / MICROSTEPS;   // 0.05625 °
-const float DEG_PER_UM = 280.61f;       // 1 µm ⇆ 280.61 °
+const float DEG_PER_UM = 280.61f;       // 1 µm = 280.61 °
 
 // fine tune parameters
 const float PROBE_START   = 10.0f;   // first zoom jump
