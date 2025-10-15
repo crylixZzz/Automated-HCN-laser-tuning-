@@ -10,41 +10,41 @@
 #include <Arduino.h>
 #include <math.h>
 
-// ----- hardware pins (mirrored) -----
+// pins
 const byte STEP_PIN  = 8;
 const byte DIR_PIN   = 9;
 const byte EN_PIN    = 10;
 const byte LIM_LEFT  = 2;
 const byte LIM_RIGHT = 3;
 
-// ----- motor profile -----
+// profile (motor)
 const float STEP_DEG   = 0.9f;
 const int   MICROSTEPS = 16;
 const float uSTEP_DEG  = STEP_DEG / MICROSTEPS;   // 0.05625 °
 const float DEG_PER_UM = 280.61f;
 
-// ----- fine scan parameters -----
+// fine tune parameters
 const float PROBE_START   = 10.0f;
 const byte  PROBE_PASSES  = 8;
 const float GAIN_MIN_V    = 0.001f;
 const byte  GAIN_NOGAIN   = 3;
 
-// ----- acquisition + timing -----
+// timing and acquisition
 const unsigned long MAX_SCAN_TIME_US   = 90000000UL;
 const unsigned long DEFAULT_SAMPLE_US  = 2000UL;
 
-// ----- runtime state -----
+// runtime state
 float rngDeg       = 0.0f;
 long  stepAbs      = 0;
 float crestSum     = 0.0f;
 bool  driverOn     = true;
 unsigned long scanStartUs = 0;
 
-// ----- limit simulation flags -----
+// flag limits
 bool limitFlag = false;
 bool limitLeft = false;   // true = left, false = right
 
-// ----- waveform generator -----
+// generate simulated wave forms
 struct Segment { float st, w, a; };
 Segment seg[120];
 int segN = 0;
@@ -78,7 +78,7 @@ float simV(float magDeg, bool rms)
   return 0.0f;
 }
 
-// ----- buffered sampler (mirrors real build) -----
+// buffered sampled
 struct SampleBuffer
 {
   static const byte DEPTH = 5;
@@ -176,7 +176,7 @@ struct SampleBuffer
 
 SampleBuffer sampler;
 
-// ----- driver helpers -----
+// driver helpers
 inline void drvOn()
 {
   if (!driverOn)
@@ -192,7 +192,7 @@ inline void drvOff()
   driverOn = false;
 }
 
-// ----- microstep primitive -----
+// set microstep
 void ustep(bool cw)
 {
   drvOn();
@@ -203,7 +203,7 @@ void ustep(bool cw)
   stepAbs += cw ? 1 : -1;
 }
 
-// ----- virtual ADC helper -----
+// ADC helper (virtual, mimic LTC)
 inline float readInstantVrms()
 {
   float magDeg = fabs(stepAbs * uSTEP_DEG);
@@ -221,7 +221,7 @@ float readVrms()
   return sampler.push(instant);
 }
 
-// ----- limit retreat -----
+// limit controls
 void retreatLimit()
 {
   Serial.println(limitLeft ?
@@ -235,7 +235,7 @@ void retreatLimit()
   limitFlag = false;
 }
 
-// ----- diagnostics (uses simulated channel) -----
+// diagnostics
 void railDiagnostic()
 {
   const int samples = 200;
@@ -261,7 +261,7 @@ void railDiagnostic()
   Serial.println(F(" V"));
 }
 
-// ----- time budget helper -----
+// time helper (budget @ 90s)
 bool timeBudgetExceeded()
 {
   return (micros() - scanStartUs) > MAX_SCAN_TIME_US;
@@ -274,10 +274,10 @@ bool checkBudgetAbort()
   return true;
 }
 
-// ----- fine scan -----
+// fine tune
 void fine(float crestDeg)
 {
-  Serial.println(F("--- Fine Start ---"));
+  Serial.println(F("Fine tuning"));
   const float span  = fabs(rngDeg);
 
   float bestDeg = crestDeg;
@@ -340,7 +340,7 @@ void fine(float crestDeg)
   }
 
   float um = fabs(bestDeg) / DEG_PER_UM;
-  Serial.println(F("--- Fine Done ---"));
+  Serial.println(F("Fine tune complete"));
   Serial.print(F("Crest ")); Serial.print(bestV,4);
   Serial.print(F(" V @ "));  Serial.print(bestDeg,4);
   Serial.print(F("° ("));    Serial.print(um,4); Serial.println(F(" µm)"));
@@ -348,10 +348,10 @@ void fine(float crestDeg)
   crestSum += bestDeg;
 }
 
-// ----- coarse scan -----
+// coarse tune
 void coarse()
 {
-  Serial.println(F("--- Coarse Start ---"));
+  Serial.println(F("Coarse tuning"));
   bool cw      = (rngDeg > 0.0f);
   long total   = lround(fabs(rngDeg) / uSTEP_DEG);
 
@@ -388,7 +388,7 @@ void coarse()
   }
   if (limitFlag) { retreatLimit(); return; }
 
-  Serial.print(F("--- Coarse Done ---\nPeak "));
+  Serial.print(F("Coarse done\nPeak "));
   Serial.print(peakV,4); Serial.print(F(" V @ "));
   Serial.print(peakDeg,3); Serial.println(F("°"));
 
@@ -407,7 +407,7 @@ void coarse()
   fine(peakDeg);
 }
 
-// ----- reset home -----
+// reset home
 void resetHome()
 {
   if (crestSum == 0.0f) { Serial.println(F("Already at home.")); return; }
@@ -419,7 +419,7 @@ void resetHome()
   Serial.println(F("Home."));
 }
 
-// ----- setup + loop -----
+// setup and loop
 void printHelp()
 {
   Serial.println(F("Commands:"));
