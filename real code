@@ -10,7 +10,7 @@
 #include <Arduino.h>
 #include <math.h>
 
-// ----- hardware pins -----
+// pins
 const byte STEP_PIN  = 8;
 const byte DIR_PIN   = 9;
 const byte EN_PIN    = 10;
@@ -18,35 +18,35 @@ const byte ADC_PIN   = A0;     // LTC1968 OUT (0–5 V)
 const byte LIM_LEFT  = 2;      // LOW = left  limit hit
 const byte LIM_RIGHT = 3;      // LOW = right limit hit
 
-// ----- motor profile -----
+// motor profile
 const float STEP_DEG   = 0.9f;          // full-step
 const int   MICROSTEPS = 16;            // TB6600 set to 1/16
 const float uSTEP_DEG  = STEP_DEG / MICROSTEPS;   // 0.05625 °
 const float DEG_PER_UM = 280.61f;       // 1 µm ⇆ 280.61 °
 
-// ----- fine scan parameters -----
+// fine tune parameters
 const float PROBE_START   = 10.0f;   // first zoom jump
 const byte  PROBE_PASSES  = 8;
 const float GAIN_MIN_V    = 0.001f;  // 1 mV
 const byte  GAIN_NOGAIN   = 3;
 
-// ----- acquisition + timing -----
+// timing 
 const unsigned long MAX_SCAN_TIME_US   = 90000000UL;   // 90 seconds budget
 const unsigned long DEFAULT_SAMPLE_US  = 2000UL;        // 2 µs target cadence from LTC1968
 const float         ADC_SCALE          = 5.0f / 1023.0f;
 
-// ----- runtime state -----
+// runtime state 
 float rngDeg       = 0.0f;      // signed sweep span
 long  stepAbs      = 0;         // usteps from home
 float crestSum     = 0.0f;      // sum crest (for reset)
 bool  driverOn     = true;
 unsigned long scanStartUs = 0;
 
-// ----- limit interrupt flags -----
+// limit interruptions
 volatile bool limitFlag  = false;
 volatile bool limitLeft  = false;   // true = left, false = right
 
-// ----- buffered sampler for LTC1968 -----
+// buffer sampler LTC
 struct SampleBuffer
 {
   static const byte DEPTH = 5;          // collect 5 points for optimisation
@@ -55,7 +55,7 @@ struct SampleBuffer
   byte  head       = 0;
   float sum        = 0.0f;
   float sumSq      = 0.0f;
-  bool  averaging  = true;              // toggle real-time vs buffered
+  bool  averaging  = true;              // toggle real time vs buffered
   unsigned long minIntervalUs = DEFAULT_SAMPLE_US;
   unsigned long lastUs        = 0;
   bool firstSample            = true;
@@ -148,7 +148,7 @@ struct SampleBuffer
 
 SampleBuffer sampler;
 
-// ----- driver helpers -----
+// driver helpers
 inline void drvOn()
 {
   if (!driverOn)
@@ -164,7 +164,7 @@ inline void drvOff()
   driverOn = false;
 }
 
-// ----- microstep primitive -----
+// microstep setup
 void ustep(bool cw)
 {
   drvOn();
@@ -175,7 +175,7 @@ void ustep(bool cw)
   stepAbs += cw ? 1 : -1;
 }
 
-// ----- raw ADC helper from LTC -----
+// ADC helper from LTC
 inline float readInstantVrms()
 {
   int a = analogRead(ADC_PIN);          // 0–1023
@@ -193,11 +193,11 @@ float readVrms()
   return sampler.push(instant);
 }
 
-// ----- limit interrupts -----
+// limit interrupt
 void ISR_left()  { limitFlag = true; limitLeft = true;  }
 void ISR_right() { limitFlag = true; limitLeft = false; }
 
-// ----- limit retreat -----
+// limit retreat
 void retreatLimit()
 {
   Serial.println(limitLeft ?
@@ -211,7 +211,7 @@ void retreatLimit()
   limitFlag = false;            // clear flag
 }
 
-// ----- diagnostics for voltage rails -----
+// diagnostic voltage rails
 void railDiagnostic()
 {
   const int samples = 200;
@@ -238,7 +238,7 @@ void railDiagnostic()
   Serial.println(F("Connect 3.3 V / 5 V / GND sequentially to confirm stability."));
 }
 
-// ----- coarse helpers -----
+// coarse helpers
 bool timeBudgetExceeded()
 {
   return (micros() - scanStartUs) > MAX_SCAN_TIME_US;
@@ -251,10 +251,10 @@ bool checkBudgetAbort()
   return true;
 }
 
-// ----- fine scan -----
+// fine tune
 void fine(float crestDeg)
 {
-  Serial.println(F("--- Fine Start ---"));
+  Serial.println(F("fine start"));
   const float span  = fabs(rngDeg);
 
   float bestDeg = crestDeg;
@@ -295,7 +295,7 @@ void fine(float crestDeg)
   }
   if (limitFlag) { retreatLimit(); return; }
 
-  // zoom search with progressively smaller hops
+  // zoom search with increasingly smaller hops
   float jump = PROBE_START; byte noGain = 0;
   while (noGain < GAIN_NOGAIN && jump > uSTEP_DEG*0.5f && !limitFlag)
   {
@@ -329,7 +329,7 @@ void fine(float crestDeg)
   crestSum += bestDeg;
 }
 
-// ----- coarse scan -----
+// coarse tune
 void coarse()
 {
   Serial.println(F("--- Coarse Start ---"));
@@ -363,7 +363,7 @@ void coarse()
 
     if (sampler.deviation() < 0.0005f && fabs(sampler.slope()) < 5.0f)
     {
-      // plateau detected; no need to overscan when signal is flat
+      // nullness detected; no need to overscan when signal is flat
       Serial.println(F("[Info] Plateau detected – accelerating coarse scan."));
       break;
     }
@@ -392,7 +392,7 @@ void coarse()
   fine(peakDeg);
 }
 
-// ----- reset to home -----
+// reset home
 void resetHome()
 {
   if (crestSum == 0.0f) { Serial.println(F("Already at home.")); return; }
@@ -406,7 +406,7 @@ void resetHome()
   Serial.println(F("Home."));
 }
 
-// ----- setup + loop -----
+// setup+loop
 void printHelp()
 {
   Serial.println(F("Commands:"));
