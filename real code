@@ -4,46 +4,167 @@
   • Limits :  Left  on D2  (INPUT_PULLUP, LOW = hit)
               Right on D3  (INPUT_PULLUP, LOW = hit)
   • 1/16 micro-stepping  →  0.05625° per ustep
-  • Serial 115200 commands  A (auto 2000 deg) / S (self assigned deg) / R (reset home 0 deg) / Y (disable motor)*/
+  • Serial 115200 commands  A (auto 2000 deg) / S (self assigned deg) / R (reset home 0 deg) / Y (disable motor)
+  • Time base must be disciplined (GPS-backed NTP master → LAN module → SPI bridge if needed) for µs accurate scheduling.*/
 
-  
 #include <Arduino.h>
+#include <math.h>
 
-//setup
+// ----- hardware pins -----
 const byte STEP_PIN  = 8;
 const byte DIR_PIN   = 9;
 const byte EN_PIN    = 10;
-const byte ADC_PIN   = A0;     // LTC1968 OUT
+const byte ADC_PIN   = A0;     // LTC1968 OUT (0–5 V)
 const byte LIM_LEFT  = 2;      // LOW = left  limit hit
 const byte LIM_RIGHT = 3;      // LOW = right limit hit
 
-//motor stuff
+// ----- motor profile -----
 const float STEP_DEG   = 0.9f;          // full-step
 const int   MICROSTEPS = 16;            // TB6600 set to 1/16
 const float uSTEP_DEG  = STEP_DEG / MICROSTEPS;   // 0.05625 °
 const float DEG_PER_UM = 280.61f;       // 1 µm ⇆ 280.61 °
 
-//fine parameters
-const float PROBE_START  = 10.0f;   // first zoom jump
-const byte  PROBE_PASSES = 8;
-const float GAIN_MIN_V   = 0.001f;  // 1 mV
-const byte  GAIN_NOGAIN  = 3;
+// ----- fine scan parameters -----
+const float PROBE_START   = 10.0f;   // first zoom jump
+const byte  PROBE_PASSES  = 8;
+const float GAIN_MIN_V    = 0.001f;  // 1 mV
+const byte  GAIN_NOGAIN   = 3;
 
-//globals
+// ----- acquisition + timing -----
+const unsigned long MAX_SCAN_TIME_US   = 90000000UL;   // 90 seconds budget
+const unsigned long DEFAULT_SAMPLE_US  = 2000UL;        // 2 µs target cadence from LTC1968
+const float         ADC_SCALE          = 5.0f / 1023.0f;
+
+// ----- runtime state -----
 float rngDeg       = 0.0f;      // signed sweep span
 long  stepAbs      = 0;         // usteps from home
 float crestSum     = 0.0f;      // sum crest (for reset)
 bool  driverOn     = true;
+unsigned long scanStartUs = 0;
 
-//limit interrupt flags
+// ----- limit interrupt flags -----
 volatile bool limitFlag  = false;
 volatile bool limitLeft  = false;   // true = left, false = right
 
-//driver helpers
-inline void drvOn()  { if (!driverOn) { digitalWrite(EN_PIN, LOW); driverOn = true; } }
-inline void drvOff() { digitalWrite(EN_PIN, HIGH); driverOn = false; }
+// ----- buffered sampler for LTC1968 -----
+struct SampleBuffer
+{
+  static const byte DEPTH = 5;          // collect 5 points for optimisation
+  float buf[DEPTH];
+  byte  count      = 0;
+  byte  head       = 0;
+  float sum        = 0.0f;
+  float sumSq      = 0.0f;
+  bool  averaging  = true;              // toggle real-time vs buffered
+  unsigned long minIntervalUs = DEFAULT_SAMPLE_US;
+  unsigned long lastUs        = 0;
+  bool firstSample            = true;
 
-// 1 microstep + extra limit hits
+  void reset()
+  {
+    count = 0; head = 0; sum = 0.0f; sumSq = 0.0f; firstSample = true;
+  }
+
+  void setInterval(unsigned long us)
+  {
+    if (us < 200UL) us = 200UL;       // guard unrealistic spacing
+    minIntervalUs = us;
+  }
+
+  bool ready()
+  {
+    unsigned long now = micros();
+    if (firstSample || now - lastUs >= minIntervalUs)
+    {
+      firstSample = false;
+      lastUs = now;
+      return true;
+    }
+    return false;
+  }
+
+  float push(float v)
+  {
+    if (count == DEPTH)
+    {
+      byte tail = (head + DEPTH - count) % DEPTH;
+      float old = buf[tail];
+      sum   -= old;
+      sumSq -= old * old;
+    }
+    else
+    {
+      ++count;
+    }
+
+    buf[head] = v;
+    sum   += v;
+    sumSq += v * v;
+    head = (head + 1) % DEPTH;
+    return value();
+  }
+
+  float latest() const
+  {
+    if (!count) return 0.0f;
+    byte idx = (head + DEPTH - 1) % DEPTH;
+    return buf[idx];
+  }
+
+  float value() const
+  {
+    if (!count) return 0.0f;
+    return averaging ? (sum / count) : latest();
+  }
+
+  float deviation() const
+  {
+    if (count < 2) return 0.0f;
+    float mean = sum / count;
+    float var  = sumSq / count - mean * mean;
+    if (var < 0.0f) var = 0.0f;
+    return sqrtf(var);
+  }
+
+  float slope() const
+  {
+    if (count < 2) return 0.0f;
+    byte tail = (head + DEPTH - count) % DEPTH;
+    float newest = latest();
+    float oldest = buf[tail];
+    float dt = (float)(count - 1) * (float)minIntervalUs * 1e-6f;
+    if (dt <= 0.0f) return 0.0f;
+    return (newest - oldest) / dt;   // V/s
+  }
+
+  void setAveraging(bool enable)
+  {
+    averaging = enable;
+  }
+
+  bool usingAverage() const { return averaging; }
+  byte size() const { return count; }
+};
+
+SampleBuffer sampler;
+
+// ----- driver helpers -----
+inline void drvOn()
+{
+  if (!driverOn)
+  {
+    digitalWrite(EN_PIN, LOW);
+    driverOn = true;
+  }
+}
+
+inline void drvOff()
+{
+  digitalWrite(EN_PIN, HIGH);
+  driverOn = false;
+}
+
+// ----- microstep primitive -----
 void ustep(bool cw)
 {
   drvOn();
@@ -54,18 +175,29 @@ void ustep(bool cw)
   stepAbs += cw ? 1 : -1;
 }
 
-//ADC helper from LTC
-inline float readVrms()
+// ----- raw ADC helper from LTC -----
+inline float readInstantVrms()
 {
   int a = analogRead(ADC_PIN);          // 0–1023
-  return (a * 5.0f) / 1023.0f;          // V
+  return a * ADC_SCALE;                 // convert to volts
 }
 
-//limit interrupting 
+float readVrms()
+{
+  if (!sampler.ready())
+  {
+    if (sampler.size()) return sampler.value();
+  }
+
+  float instant = readInstantVrms();
+  return sampler.push(instant);
+}
+
+// ----- limit interrupts -----
 void ISR_left()  { limitFlag = true; limitLeft = true;  }
 void ISR_right() { limitFlag = true; limitLeft = false; }
 
-//stop n retreat 2000 deg
+// ----- limit retreat -----
 void retreatLimit()
 {
   Serial.println(limitLeft ?
@@ -79,7 +211,47 @@ void retreatLimit()
   limitFlag = false;            // clear flag
 }
 
-//FINETUNE
+// ----- diagnostics for voltage rails -----
+void railDiagnostic()
+{
+  const int samples = 200;
+  sampler.reset();
+  float sum = 0.0f;
+  float sumSq = 0.0f;
+  for (int i = 0; i < samples; ++i)
+  {
+    while (!sampler.ready());
+    float v = readInstantVrms();
+    sum   += v;
+    sumSq += v * v;
+    delayMicroseconds(200);
+  }
+
+  float mean = sum / samples;
+  float var  = sumSq / samples - mean * mean;
+  if (var < 0.0f) var = 0.0f;
+  float sigma = sqrtf(var);
+
+  Serial.print(F("[Diag] Mean="));  Serial.print(mean, 4);
+  Serial.print(F(" V  σ="));        Serial.print(sigma, 5);
+  Serial.println(F(" V"));
+  Serial.println(F("Connect 3.3 V / 5 V / GND sequentially to confirm stability."));
+}
+
+// ----- coarse helpers -----
+bool timeBudgetExceeded()
+{
+  return (micros() - scanStartUs) > MAX_SCAN_TIME_US;
+}
+
+bool checkBudgetAbort()
+{
+  if (!timeBudgetExceeded()) return false;
+  Serial.println(F("[WARN] Scan aborted – exceeded 90 s budget."));
+  return true;
+}
+
+// ----- fine scan -----
 void fine(float crestDeg)
 {
   Serial.println(F("--- Fine Start ---"));
@@ -89,9 +261,10 @@ void fine(float crestDeg)
   float bestV   = readVrms();
   const float halfV = bestV * 0.5f;
 
-  //capture left trough
+  // capture left trough
   while (!limitFlag)
   {
+    if (checkBudgetAbort()) return;
     ustep(false); bestDeg -= uSTEP_DEG;
     float v = readVrms();
     Serial.print(F("Fine L ")); Serial.print(bestDeg,3);
@@ -100,15 +273,20 @@ void fine(float crestDeg)
   }
   if (limitFlag) { retreatLimit(); return; }
 
-  //return to crest 
+  // return to crest
   long crestIdx = lround(fabs(crestDeg) / uSTEP_DEG);
-  while (!limitFlag && stepAbs != crestIdx) ustep(stepAbs < crestIdx);
+  while (!limitFlag && stepAbs != crestIdx)
+  {
+    if (checkBudgetAbort()) return;
+    ustep(stepAbs < crestIdx);
+  }
   if (limitFlag) { retreatLimit(); return; }
 
-  //capture right trough
+  // capture right trough
   float right = crestDeg;
   while (!limitFlag)
   {
+    if (checkBudgetAbort()) return;
     ustep(true);  right += uSTEP_DEG;
     float v = readVrms();
     Serial.print(F("Fine R ")); Serial.print(right,3);
@@ -117,7 +295,7 @@ void fine(float crestDeg)
   }
   if (limitFlag) { retreatLimit(); return; }
 
-  //zoom search
+  // zoom search with progressively smaller hops
   float jump = PROBE_START; byte noGain = 0;
   while (noGain < GAIN_NOGAIN && jump > uSTEP_DEG*0.5f && !limitFlag)
   {
@@ -127,7 +305,11 @@ void fine(float crestDeg)
       float probe = crestDeg + s*jump;
       if (fabs(probe) > span) continue;
       long tgt = lround(fabs(probe) / uSTEP_DEG);
-      while (!limitFlag && stepAbs != tgt) ustep(stepAbs < tgt);
+      while (!limitFlag && stepAbs != tgt)
+      {
+        if (checkBudgetAbort()) return;
+        ustep(stepAbs < tgt);
+      }
       if (limitFlag) { retreatLimit(); return; }
       float v = readVrms();
       Serial.print(F("Fine probe ")); Serial.print(probe,4);
@@ -147,7 +329,7 @@ void fine(float crestDeg)
   crestSum += bestDeg;
 }
 
-//COARSE SCAN
+// ----- coarse scan -----
 void coarse()
 {
   Serial.println(F("--- Coarse Start ---"));
@@ -158,16 +340,33 @@ void coarse()
 
   for (long i=1; i<=total && !limitFlag; ++i)
   {
+    if (checkBudgetAbort()) return;
     ustep(cw);
     float dMag = i * uSTEP_DEG;
     float dSgn = cw ? dMag : -dMag;
     float vRMS = readVrms();
-    if (vRMS > 0.5f && fabs(vRMS - prevV) > 0.001f) {
+
+    if (vRMS > 0.5f && fabs(vRMS - prevV) > 0.001f)
+    {
       Serial.print(F("Deg ")); Serial.print(dSgn,3);
-      Serial.print(F("°  "));  Serial.println(vRMS,4);
+      Serial.print(F("°  "));  Serial.print(vRMS,4);
+      Serial.print(F(" V  dV/dt=")); Serial.print(sampler.slope(), 2);
+      Serial.println(F(" V/s"));
       prevV = vRMS;
     }
-    if (vRMS > peakV) { peakV = vRMS; peakDeg = dSgn; }
+
+    if (vRMS > peakV)
+    {
+      peakV   = vRMS;
+      peakDeg = dSgn;
+    }
+
+    if (sampler.deviation() < 0.0005f && fabs(sampler.slope()) < 5.0f)
+    {
+      // plateau detected; no need to overscan when signal is flat
+      Serial.println(F("[Info] Plateau detected – accelerating coarse scan."));
+      break;
+    }
   }
 
   if (limitFlag) { retreatLimit(); return; }
@@ -176,20 +375,24 @@ void coarse()
   Serial.print(peakV,4); Serial.print(F(" V @ "));
   Serial.print(peakDeg,3); Serial.println(F("°"));
 
-  //back 2 peak
+  // back to peak
   float retreat = rngDeg - peakDeg;
   Serial.print(F("Retreat ")); Serial.print(retreat,3); Serial.println(F("°"));
 
   bool backCW = (retreat < 0.0f);
   long rSteps = lround(fabs(retreat) / uSTEP_DEG);
-  for (long i=0; i<rSteps && !limitFlag; ++i) ustep(backCW);
+  for (long i=0; i<rSteps && !limitFlag; ++i)
+  {
+    if (checkBudgetAbort()) return;
+    ustep(backCW);
+  }
 
   if (limitFlag) { retreatLimit(); return; }
 
   fine(peakDeg);
 }
 
-//reset home 0 deg
+// ----- reset to home -----
 void resetHome()
 {
   if (crestSum == 0.0f) { Serial.println(F("Already at home.")); return; }
@@ -203,10 +406,23 @@ void resetHome()
   Serial.println(F("Home."));
 }
 
-//setup + loop
+// ----- setup + loop -----
+void printHelp()
+{
+  Serial.println(F("Commands:"));
+  Serial.println(F(" A – auto coarse scan (2000°)"));
+  Serial.println(F(" S – self-tune, enter degrees"));
+  Serial.println(F(" R – reset to home"));
+  Serial.println(F(" Y – disable motor driver"));
+  Serial.println(F(" B – toggle buffered average vs real-time sample"));
+  Serial.println(F(" I – set sampler interval in µs"));
+  Serial.println(F(" T – run voltage rail diagnostic (connect 3.3 V / 5 V / GND)"));
+  Serial.println(F(" H – print this help"));
+  Serial.println(F("[Note] Maintain network time via NTP server for synchronised lab instruments."));
+}
+
 void setup()
 {
-  //[ins
   pinMode(STEP_PIN, OUTPUT);
   pinMode(DIR_PIN,  OUTPUT);
   pinMode(EN_PIN,   OUTPUT);
@@ -214,12 +430,14 @@ void setup()
   pinMode(LIM_LEFT,  INPUT_PULLUP);
   pinMode(LIM_RIGHT, INPUT_PULLUP);
 
-  //limit inturrupt
   attachInterrupt(digitalPinToInterrupt(LIM_LEFT),  ISR_left,  FALLING);
   attachInterrupt(digitalPinToInterrupt(LIM_RIGHT), ISR_right, FALLING);
 
+  sampler.reset();
+
   Serial.begin(115200);
-  Serial.println(F("[Real] Ready – A (2000 deg cw) / S (enter degrees) / R (reset home) / Y (disable motor)"));
+  Serial.println(F("[Real] Ready – A/S/R/Y plus B/I/T/H. Ensure LAN module → SPI bridge for time disciplined operation."));
+  printHelp();
 }
 
 void loop()
@@ -229,26 +447,50 @@ void loop()
   if (!Serial.available()) return;
   String cmd = Serial.readStringUntil('\n'); cmd.trim();
 
-  
-  if (cmd == "Y") { drvOff(); Serial.println(F("Driver off")); return; }
-  if (cmd == "R") { resetHome(); return; }
+  if (cmd.equalsIgnoreCase("H")) { printHelp(); return; }
+  if (cmd.equalsIgnoreCase("Y")) { drvOff(); Serial.println(F("Driver off")); return; }
+  if (cmd.equalsIgnoreCase("R")) { resetHome(); return; }
+  if (cmd.equalsIgnoreCase("T")) { railDiagnostic(); return; }
+  if (cmd.equalsIgnoreCase("B"))
+  {
+    sampler.setAveraging(!sampler.usingAverage());
+    Serial.print(F("[Sampler] Mode → "));
+    Serial.println(sampler.usingAverage() ? F("Buffered (5-point)") : F("Real-time"));
+    return;
+  }
+  if (cmd.startsWith("I"))
+  {
+    unsigned long interval = cmd.substring(1).toInt();
+    if (interval == 0)
+    {
+      Serial.println(F("[Sampler] Provide interval in µs, e.g. I2000"));
+      return;
+    }
+    sampler.setInterval(interval);
+    Serial.print(F("[Sampler] Interval set to "));
+    Serial.print(interval);
+    Serial.println(F(" µs"));
+    return;
+  }
 
-  //scan cmds
+  // scan commands
   if (cmd.equalsIgnoreCase("A"))      rngDeg = 2000.0f;
-  else if (cmd.equalsIgnoreCase("S")) {
+  else if (cmd.equalsIgnoreCase("S"))
+  {
     Serial.println(F("Degrees?")); while (!Serial.available());
     rngDeg = Serial.parseFloat(); while (Serial.available()) Serial.read();
     if (rngDeg == 0.0f) rngDeg = 2000.0f;
   }
-  else { Serial.println(F("Bad cmd")); return; }
+  else
+  {
+    Serial.println(F("Bad cmd"));
+    return;
+  }
 
   drvOn();
-  stepAbs  = 0;
+  stepAbs   = 0;
   limitFlag = false;
+  sampler.reset();
+  scanStartUs = micros();
   coarse();
 }
-
-LAN communicate
-5 sec stop coarse
-buffer maybe hard
-download ltc library

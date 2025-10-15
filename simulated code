@@ -1,55 +1,65 @@
 /*Plasma Density Scanner – SIMULATED
   • Driver :  TB6600  (STEP D8, DIR D9, EN D10  – active-LOW)
-  • Sensor :  LTC1968  RMS-to-DC  →  Arduino A0  (0–5 V)
+  • Sensor :  virtual LTC1968 RMS-to-DC, synthesised signal
   • Limits :  Left  on D2  (INPUT_PULLUP, LOW = hit)
               Right on D3  (INPUT_PULLUP, LOW = hit)
   • 1/16 micro-stepping  →  0.05625° per ustep
-  • Serial 115200 commands  A (auto 2000 deg) / S (self assigned deg) / R (reset home 0 deg) / Y (disable motor)*/
+  • Serial 115200 commands  A (auto 2000 deg) / S (self assigned deg) / R (reset home 0 deg) / Y (disable motor)
+  • Shares same timing + buffering model as real build for drop-in validation.*/
 
 #include <Arduino.h>
 #include <math.h>
 
-//setup
+// ----- hardware pins (mirrored) -----
 const byte STEP_PIN  = 8;
 const byte DIR_PIN   = 9;
 const byte EN_PIN    = 10;
-const byte ADC_PIN   = A0;     // no real ADC for sim
-const byte LIM_LEFT  = 2;      // symbolic
-const byte LIM_RIGHT = 3;      // symbolic
+const byte LIM_LEFT  = 2;
+const byte LIM_RIGHT = 3;
 
-//motor stuff
+// ----- motor profile -----
 const float STEP_DEG   = 0.9f;
 const int   MICROSTEPS = 16;
 const float uSTEP_DEG  = STEP_DEG / MICROSTEPS;   // 0.05625 °
 const float DEG_PER_UM = 280.61f;
 
-//fine parameters
-const float PROBE_START  = 10.0f;
-const byte  PROBE_PASSES = 8;
-const float GAIN_MIN_V   = 0.001f;
-const byte  GAIN_NOGAIN  = 3;
+// ----- fine scan parameters -----
+const float PROBE_START   = 10.0f;
+const byte  PROBE_PASSES  = 8;
+const float GAIN_MIN_V    = 0.001f;
+const byte  GAIN_NOGAIN   = 3;
 
-//globals
-float rngDeg   = 0.0f;
-long  stepAbs  = 0;
-float crestSum = 0.0f;
-bool  driverOn = true;
+// ----- acquisition + timing -----
+const unsigned long MAX_SCAN_TIME_US   = 90000000UL;
+const unsigned long DEFAULT_SAMPLE_US  = 2000UL;
 
-//limit sim flag
+// ----- runtime state -----
+float rngDeg       = 0.0f;
+long  stepAbs      = 0;
+float crestSum     = 0.0f;
+bool  driverOn     = true;
+unsigned long scanStartUs = 0;
+
+// ----- limit simulation flags -----
 bool limitFlag = false;
 bool limitLeft = false;   // true = left, false = right
 
-//sim wave model
+// ----- waveform generator -----
 struct Segment { float st, w, a; };
-Segment seg[100]; int segN = 0;
+Segment seg[120];
+int segN = 0;
 
 void makeSegments()
 {
-  segN = 0;  float span = fabs(rngDeg), pos = 0.0f;
-  randomSeed(analogRead(A1));               // random seed
-  while (pos < span && segN < 100) {
-    float w = random(30, 91); if (pos + w > span) w = span - pos;
-    seg[segN++] = { pos, w, random(100,501)/100.0f };
+  segN = 0;
+  float span = fabs(rngDeg);
+  float pos  = 0.0f;
+  randomSeed(analogRead(A1));               // random seed (sim input)
+  while (pos < span && segN < 120)
+  {
+    float w = random(30, 91);
+    if (pos + w > span) w = span - pos;
+    seg[segN++] = { pos, w, random(100, 501) / 100.0f };
     pos += w;
   }
 }
@@ -57,17 +67,132 @@ void makeSegments()
 float simV(float magDeg, bool rms)
 {
   for (int i=0; i<segN; ++i)
+  {
     if (magDeg >= seg[i].st && magDeg < seg[i].st + seg[i].w)
-      return rms ? seg[i].a * 0.707f
-                 : seg[i].a * sin((magDeg-seg[i].st)/seg[i].w * PI);
+    {
+      float phase = (magDeg - seg[i].st) / seg[i].w * PI;
+      float peak  = seg[i].a;
+      return rms ? peak * 0.707f : peak * sin(phase);
+    }
+  }
   return 0.0f;
 }
 
-//driver helpers
-inline void drvOn()  { if (!driverOn) { digitalWrite(EN_PIN, LOW);  driverOn = true; } }
-inline void drvOff() { digitalWrite(EN_PIN, HIGH); driverOn = false; }
+// ----- buffered sampler (mirrors real build) -----
+struct SampleBuffer
+{
+  static const byte DEPTH = 5;
+  float buf[DEPTH];
+  byte  count      = 0;
+  byte  head       = 0;
+  float sum        = 0.0f;
+  float sumSq      = 0.0f;
+  bool  averaging  = true;
+  unsigned long minIntervalUs = DEFAULT_SAMPLE_US;
+  unsigned long lastUs        = 0;
+  bool firstSample            = true;
 
-// 1 microstep + extra limit hits
+  void reset()
+  {
+    count = 0; head = 0; sum = 0.0f; sumSq = 0.0f; firstSample = true;
+  }
+
+  void setInterval(unsigned long us)
+  {
+    if (us < 200UL) us = 200UL;
+    minIntervalUs = us;
+  }
+
+  bool ready()
+  {
+    unsigned long now = micros();
+    if (firstSample || now - lastUs >= minIntervalUs)
+    {
+      firstSample = false;
+      lastUs = now;
+      return true;
+    }
+    return false;
+  }
+
+  float push(float v)
+  {
+    if (count == DEPTH)
+    {
+      byte tail = (head + DEPTH - count) % DEPTH;
+      float old = buf[tail];
+      sum   -= old;
+      sumSq -= old * old;
+    }
+    else
+    {
+      ++count;
+    }
+
+    buf[head] = v;
+    sum   += v;
+    sumSq += v * v;
+    head = (head + 1) % DEPTH;
+    return value();
+  }
+
+  float latest() const
+  {
+    if (!count) return 0.0f;
+    byte idx = (head + DEPTH - 1) % DEPTH;
+    return buf[idx];
+  }
+
+  float value() const
+  {
+    if (!count) return 0.0f;
+    return averaging ? (sum / count) : latest();
+  }
+
+  float deviation() const
+  {
+    if (count < 2) return 0.0f;
+    float mean = sum / count;
+    float var  = sumSq / count - mean * mean;
+    if (var < 0.0f) var = 0.0f;
+    return sqrtf(var);
+  }
+
+  float slope() const
+  {
+    if (count < 2) return 0.0f;
+    byte tail = (head + DEPTH - count) % DEPTH;
+    float newest = latest();
+    float oldest = buf[tail];
+    float dt = (float)(count - 1) * (float)minIntervalUs * 1e-6f;
+    if (dt <= 0.0f) return 0.0f;
+    return (newest - oldest) / dt;
+  }
+
+  void setAveraging(bool enable) { averaging = enable; }
+  bool usingAverage() const { return averaging; }
+  byte size() const { return count; }
+};
+
+SampleBuffer sampler;
+
+// ----- driver helpers -----
+inline void drvOn()
+{
+  if (!driverOn)
+  {
+    digitalWrite(EN_PIN, LOW);
+    driverOn = true;
+  }
+}
+
+inline void drvOff()
+{
+  digitalWrite(EN_PIN, HIGH);
+  driverOn = false;
+}
+
+// ----- microstep primitive -----
 void ustep(bool cw)
 {
   drvOn();
@@ -78,14 +203,25 @@ void ustep(bool cw)
   stepAbs += cw ? 1 : -1;
 }
 
-//ADC from sim wave
-inline float readVrms()
+// ----- virtual ADC helper -----
+inline float readInstantVrms()
 {
   float magDeg = fabs(stepAbs * uSTEP_DEG);
-  return simV(magDeg, true);    // RMS value
+  return simV(magDeg, true);
 }
 
-//stop n retreat 2000 deg
+float readVrms()
+{
+  if (!sampler.ready())
+  {
+    if (sampler.size()) return sampler.value();
+  }
+
+  float instant = readInstantVrms();
+  return sampler.push(instant);
+}
+
+// ----- limit retreat -----
 void retreatLimit()
 {
   Serial.println(limitLeft ?
@@ -99,7 +235,46 @@ void retreatLimit()
   limitFlag = false;
 }
 
-//finetune (sim)
+// ----- diagnostics (uses simulated channel) -----
+void railDiagnostic()
+{
+  const int samples = 200;
+  sampler.reset();
+  float sum = 0.0f;
+  float sumSq = 0.0f;
+  for (int i = 0; i < samples; ++i)
+  {
+    while (!sampler.ready());
+    float v = readInstantVrms();
+    sum   += v;
+    sumSq += v * v;
+    delayMicroseconds(200);
+  }
+
+  float mean = sum / samples;
+  float var  = sumSq / samples - mean * mean;
+  if (var < 0.0f) var = 0.0f;
+  float sigma = sqrtf(var);
+
+  Serial.print(F("[SimDiag] Mean="));  Serial.print(mean, 4);
+  Serial.print(F(" V  σ="));           Serial.print(sigma, 5);
+  Serial.println(F(" V"));
+}
+
+// ----- time budget helper -----
+bool timeBudgetExceeded()
+{
+  return (micros() - scanStartUs) > MAX_SCAN_TIME_US;
+}
+
+bool checkBudgetAbort()
+{
+  if (!timeBudgetExceeded()) return false;
+  Serial.println(F("[SIM WARN] Scan aborted – exceeded 90 s budget."));
+  return true;
+}
+
+// ----- fine scan -----
 void fine(float crestDeg)
 {
   Serial.println(F("--- Fine Start ---"));
@@ -111,6 +286,7 @@ void fine(float crestDeg)
 
   while (!limitFlag)
   {
+    if (checkBudgetAbort()) return;
     ustep(false); bestDeg -= uSTEP_DEG;
     float v = readVrms();
     Serial.print(F("Fine L ")); Serial.print(bestDeg,3);
@@ -120,12 +296,17 @@ void fine(float crestDeg)
   if (limitFlag) { retreatLimit(); return; }
 
   long crestIdx = lround(fabs(crestDeg) / uSTEP_DEG);
-  while (!limitFlag && stepAbs != crestIdx) ustep(stepAbs < crestIdx);
+  while (!limitFlag && stepAbs != crestIdx)
+  {
+    if (checkBudgetAbort()) return;
+    ustep(stepAbs < crestIdx);
+  }
   if (limitFlag) { retreatLimit(); return; }
 
   float right = crestDeg;
   while (!limitFlag)
   {
+    if (checkBudgetAbort()) return;
     ustep(true); right += uSTEP_DEG;
     float v = readVrms();
     Serial.print(F("Fine R ")); Serial.print(right,3);
@@ -140,9 +321,14 @@ void fine(float crestDeg)
     bool gained = false;
     for (int s=-1; s<=1; s+=2)
     {
-      float probe = crestDeg + s*jump; if (fabs(probe) > span) continue;
+      float probe = crestDeg + s*jump;
+      if (fabs(probe) > span) continue;
       long tgt = lround(fabs(probe) / uSTEP_DEG);
-      while (!limitFlag && stepAbs != tgt) ustep(stepAbs < tgt);
+      while (!limitFlag && stepAbs != tgt)
+      {
+        if (checkBudgetAbort()) return;
+        ustep(stepAbs < tgt);
+      }
       if (limitFlag) { retreatLimit(); return; }
       float v = readVrms();
       Serial.print(F("Fine probe ")); Serial.print(probe,4);
@@ -162,7 +348,7 @@ void fine(float crestDeg)
   crestSum += bestDeg;
 }
 
-//Coarse scan 
+// ----- coarse scan -----
 void coarse()
 {
   Serial.println(F("--- Coarse Start ---"));
@@ -173,17 +359,32 @@ void coarse()
 
   for (long i=1; i<=total && !limitFlag; ++i)
   {
+    if (checkBudgetAbort()) return;
     ustep(cw);
     float dMag = i * uSTEP_DEG;
     float dSgn = cw ? dMag : -dMag;
     float vRMS = readVrms();
 
-    if (vRMS > 0.5f && fabs(vRMS - prevV) > 0.001f) {
+    if (vRMS > 0.5f && fabs(vRMS - prevV) > 0.001f)
+    {
       Serial.print(F("Deg ")); Serial.print(dSgn,3);
-      Serial.print(F("°  "));  Serial.println(vRMS,4);
+      Serial.print(F("°  "));  Serial.print(vRMS,4);
+      Serial.print(F(" V  dV/dt=")); Serial.print(sampler.slope(), 2);
+      Serial.println(F(" V/s"));
       prevV = vRMS;
     }
-    if (vRMS > peakV) { peakV = vRMS; peakDeg = dSgn; }
+
+    if (vRMS > peakV)
+    {
+      peakV   = vRMS;
+      peakDeg = dSgn;
+    }
+
+    if (sampler.deviation() < 0.0005f && fabs(sampler.slope()) < 5.0f)
+    {
+      Serial.println(F("[SimInfo] Plateau detected – accelerating coarse scan."));
+      break;
+    }
   }
   if (limitFlag) { retreatLimit(); return; }
 
@@ -196,13 +397,17 @@ void coarse()
 
   bool backCW  = (retreat < 0.0f);
   long rSteps  = lround(fabs(retreat) / uSTEP_DEG);
-  for (long i=0; i<rSteps && !limitFlag; ++i) ustep(backCW);
+  for (long i=0; i<rSteps && !limitFlag; ++i)
+  {
+    if (checkBudgetAbort()) return;
+    ustep(backCW);
+  }
   if (limitFlag) { retreatLimit(); return; }
 
   fine(peakDeg);
 }
 
-//reset home 0 deg
+// ----- reset home -----
 void resetHome()
 {
   if (crestSum == 0.0f) { Serial.println(F("Already at home.")); return; }
@@ -214,7 +419,23 @@ void resetHome()
   Serial.println(F("Home."));
 }
 
-//setup + loop
+// ----- setup + loop -----
+void printHelp()
+{
+  Serial.println(F("Commands:"));
+  Serial.println(F(" A – auto coarse scan (2000°)"));
+  Serial.println(F(" S – self-tune, enter degrees"));
+  Serial.println(F(" R – reset to home"));
+  Serial.println(F(" Y – disable motor driver"));
+  Serial.println(F(" B – toggle buffered average vs real-time sample"));
+  Serial.println(F(" I – set sampler interval in µs"));
+  Serial.println(F(" T – run simulated diagnostic"));
+  Serial.println(F(" L1 – trigger left limit"));
+  Serial.println(F(" L2 – trigger right limit"));
+  Serial.println(F(" H – print this help"));
+  Serial.println(F("[SimNote] Align simulated timing with lab NTP plan for integration tests."));
+}
+
 void setup()
 {
   pinMode(STEP_PIN, OUTPUT);
@@ -222,34 +443,65 @@ void setup()
   pinMode(EN_PIN,   OUTPUT);
   digitalWrite(EN_PIN, LOW);
 
+  sampler.reset();
   Serial.begin(115200);
-  Serial.println(F("[Sim] Ready – A (2000 deg cw) / S (enter degrees) / R (reset home) / Y (disable motor) L1 (Left limit) / L2 (right limit)"));
+  Serial.println(F("[Sim] Ready – A/S/R/Y/L1/L2 plus B/I/T/H."));
+  printHelp();
 }
 
 void loop()
 {
-  if (limitFlag) { retreatLimit(); return; }    // fake limit handled here
+  if (limitFlag) { retreatLimit(); return; }
 
   if (!Serial.available()) return;
   String cmd = Serial.readStringUntil('\n'); cmd.trim();
 
-  if (cmd == "Y") { drvOff(); Serial.println(F("Driver off")); return; }
-  if (cmd == "R") { resetHome(); return; }
-
-  if (cmd == "L1") { limitFlag=true; limitLeft=true;  retreatLimit(); return; }
-  if (cmd == "L2") { limitFlag=true; limitLeft=false; retreatLimit(); return; }
+  if (cmd.equalsIgnoreCase("H")) { printHelp(); return; }
+  if (cmd.equalsIgnoreCase("Y")) { drvOff(); Serial.println(F("Driver off")); return; }
+  if (cmd.equalsIgnoreCase("R")) { resetHome(); return; }
+  if (cmd.equalsIgnoreCase("T")) { railDiagnostic(); return; }
+  if (cmd.equalsIgnoreCase("L1")) { limitFlag=true; limitLeft=true;  retreatLimit(); return; }
+  if (cmd.equalsIgnoreCase("L2")) { limitFlag=true; limitLeft=false; retreatLimit(); return; }
+  if (cmd.equalsIgnoreCase("B"))
+  {
+    sampler.setAveraging(!sampler.usingAverage());
+    Serial.print(F("[SimSampler] Mode → "));
+    Serial.println(sampler.usingAverage() ? F("Buffered (5-point)") : F("Real-time"));
+    return;
+  }
+  if (cmd.startsWith("I"))
+  {
+    unsigned long interval = cmd.substring(1).toInt();
+    if (interval == 0)
+    {
+      Serial.println(F("[SimSampler] Provide interval in µs, e.g. I2000"));
+      return;
+    }
+    sampler.setInterval(interval);
+    Serial.print(F("[SimSampler] Interval set to "));
+    Serial.print(interval);
+    Serial.println(F(" µs"));
+    return;
+  }
 
   if (cmd.equalsIgnoreCase("A"))      rngDeg = 2000.0f;
-  else if (cmd.equalsIgnoreCase("S")) {
+  else if (cmd.equalsIgnoreCase("S"))
+  {
     Serial.println(F("Degrees?")); while (!Serial.available());
     rngDeg = Serial.parseFloat(); while (Serial.available()) Serial.read();
     if (rngDeg == 0.0f) rngDeg = 2000.0f;
   }
-  else { Serial.println(F("Bad cmd")); return; }
+  else
+  {
+    Serial.println(F("Bad cmd"));
+    return;
+  }
 
   drvOn();
   makeSegments();          // generate new fake waveform
   stepAbs   = 0;
   limitFlag = false;
+  sampler.reset();
+  scanStartUs = micros();
   coarse();
 }
